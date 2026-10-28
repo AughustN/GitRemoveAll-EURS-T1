@@ -1,63 +1,104 @@
-"""Track 1 inference entry point (reference implementation: the EURS organizer baseline).
+"""Track 1 inference entry point (team GitRemoveAll, testing-phase submission #19059).
 
-The organizers call   main(model_dir, input_dir, output_dir, device)   and nothing else.
+The organizers call   main(model_dir, input_dir, output_dir, device).
 
-  model_dir   the weights/ folder of this repository (your checkpoint(s) are in there)
-  input_dir   a folder of degraded images (.png/.jpg), all at their original size
-  output_dir  write here, one file per input image, same file stem:
-                  output_dir/restored/<stem>.png    RGB restored image
-                  output_dir/seg_masks/<stem>.png   single-channel mask, labels 0..4
-              both resized to EXACTLY the scoring size: longest side 1024 px, aspect ratio kept
-              (downscale only: an input at or below 1024 px keeps its size); the evaluator rejects any other size
-  device      "cuda" or "cpu"
-
-Rules for this file (see README.md): inference only; every output must come from its own input
-image alone; no network access; deterministic (fixed seeds, model.eval()).
-The organizers add this folder and src/ to the import path, so `from src.xxx import ...` works.
+Reproduces make_submission.py of notebook F8_1022_submit_test_v3 (Kaggle, Tesla T4) step by step:
+  1. read_eval: decode one image, RGB, PIL BILINEAR down to longest side 1024 (evaluator formula); all models run here.
+  2. segmentation: frozen DINOv3 ViT-L/16 + DPT-lite, TTA scales (0.75, 1.0) x horizontal flip, mean of softmax,
+     fp16 autocast on CUDA, argmax (logit bias 0) -> seg_masks/<stem>.png (uint8 labels 0..4).
+  3. restoration: RestoreNet (ConvNeXt-T, cond='est'); the water type / level are read from the file name
+     (<scene>_<type>_<level>.png, declared as "Meta" on the leaderboard). If a file name does not carry them,
+     the network falls back to its own type/level estimate (cond=None), which is the same model without metadata.
+  4. 8-bit conversion with rounding, then the upload-size step of the leaderboard zip: values rounded to even
+     numbers (shrink_submission.py, step 2) -> restored/<stem>.png.
+Every output depends only on its own input image.
 """
+import glob
 import os
+import re
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
 
-from src.joint_model import JointModel
+from src.infer import quantize, read_eval, restore_full, seg_probs, to_u8
+from src.restore_big import build_restore, make_cond
+from src.seg_model import ViTSeg
 
-RES = (256, 256)          # (H, W) the baseline network runs at
-NUM_CLASSES = 5           # 0 background, 1 coral, 2 fish, 3 elasmobranch, 4 other
-MAX_SIDE = 1024           # scoring size cap
+SEG_CKPT = "seg_dinov3_vitl16_ext_all.pt"
+SEG_CONFIG_DIR = "dinov3_vitl16_config"      # config.json of facebook/dinov3-vitl16-pretrain-lvd1689m
+RESTORE_CKPT = "restore_big_all.pt"
+SCALES, FLIP = (0.75, 1.0), True
+BIAS = [0.0, 0.0, 0.0, 0.0, 0.0]             # background, coral, fish, elasmobranch, other
+QUANT_STEP = 2
+META_RE = re.compile(r"_(\d+)_(\d+(?:\.\d+)?)$")  # <scene>_<type>_<level>
 
 
-def _scoring_size(w, h):
-    s = MAX_SIDE / max(w, h)
-    return (w, h) if s >= 1 else (max(1, round(w * s)), max(1, round(h * s)))
+def _find(model_dir, name):
+    hits = sorted(glob.glob(os.path.join(model_dir, "**", name), recursive=True))
+    assert hits, f"{name} not found under {model_dir}"
+    return hits[0]
+
+
+def _load_seg_state(model, sd):
+    """The checkpoint was saved with transformers 5.x, where the DINOv3 blocks live under `bb.model.layer.N`;
+    transformers 4.57 (the version that runs on PyTorch 2.4) names them `bb.layer.N`. Same tensors, renamed prefix."""
+    want = set(model.state_dict())
+    for a, b in (("bb.model.layer.", "bb.layer."), ("bb.layer.", "bb.model.layer.")):
+        sd = {(b + k[len(a):] if k.startswith(a) and k not in want and b + k[len(a):] in want else k): v
+              for k, v in sd.items()}
+    model.load_state_dict(sd)
+
+
+def _cond(model, stem):
+    if getattr(model, "cond", "none") != "est":
+        return None
+    m = META_RE.search(stem)
+    return make_cond(int(m.group(1)), float(m.group(2))) if m else None
+
+
+def _restore_fit(model, img, device, cond):
+    """restore_full at scoring resolution; on CUDA OOM shrink the input by 0.75 (INTER_AREA) and upscale back."""
+    h, w = img.shape[:2]
+    x, s = img, 1.0
+    while True:
+        try:
+            out = restore_full(model, x, device, cond=cond)
+            break
+        except torch.OutOfMemoryError:
+            pass
+        torch.cuda.empty_cache()
+        s *= 0.75
+        assert s > 0.05, "OOM even at a very small restore input"
+        x = cv2.resize(img, (max(32, round(w * s)), max(32, round(h * s))), interpolation=cv2.INTER_AREA)
+    if s < 1:
+        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+    return out
 
 
 def main(model_dir, input_dir, output_dir, device):
-    torch.set_grad_enabled(False)
-    model = JointModel(resolution=RES, num_classes=NUM_CLASSES,
-                       encoder_channels=(16, 32, 64, 128),
-                       seg_decoder_channels=(64, 32, 16),
-                       rest_decoder_channels=(64, 32, 16)).to(device)
-    model.load_state_dict(torch.load(os.path.join(model_dir, "best.pt"), map_location=device, weights_only=True))
-    model.eval()
+    torch.manual_seed(0)
+    torch.backends.cudnn.benchmark = False
+    device = torch.device(device if device == "cpu" or torch.cuda.is_available() else "cpu")
+
+    ck = torch.load(_find(model_dir, SEG_CKPT), map_location="cpu", weights_only=False)
+    seg = ViTSeg(os.path.dirname(_find(model_dir, os.path.join(SEG_CONFIG_DIR, "config.json"))))
+    _load_seg_state(seg, ck["model"])
+    seg = seg.to(device).eval()
+    del ck
+    rest = build_restore(torch.load(_find(model_dir, RESTORE_CKPT), map_location="cpu", weights_only=False), device)
 
     os.makedirs(os.path.join(output_dir, "restored"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "seg_masks"), exist_ok=True)
-    H, W = RES
-    for name in sorted(os.listdir(input_dir)):
-        stem, ext = os.path.splitext(name)
-        if ext.lower() not in (".png", ".jpg", ".jpeg"):
-            continue
-        with Image.open(os.path.join(input_dir, name)) as im:
-            im = im.convert("RGB")
-            tw, th = _scoring_size(*im.size)
-            small = im.resize((W, H), Image.BILINEAR)
-        x = torch.from_numpy(np.asarray(small, dtype=np.float32).transpose(2, 0, 1) / 255.0).unsqueeze(0).to(device)
-        restored, seg_logits = model(x)
-        r = restored[0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
-        # NOTE: copy YOUR OWN conversion to 8 bit here (this baseline truncates; many methods use .round()):
-        Image.fromarray((r * 255).astype(np.uint8)).resize((tw, th), Image.BILINEAR).save(
-            os.path.join(output_dir, "restored", stem + ".png"))
-        m = seg_logits[0].argmax(dim=0).byte().cpu().numpy()
-        Image.fromarray(m).resize((tw, th), Image.NEAREST).save(os.path.join(output_dir, "seg_masks", stem + ".png"))
+    bt = torch.tensor(BIAS, device=device).view(5, 1, 1)
+    files = sorted(f for f in glob.glob(os.path.join(input_dir, "**", "*"), recursive=True)
+                   if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg"))
+    for f in files:
+        stem = os.path.splitext(os.path.basename(f))[0]
+        img = read_eval(f)
+        p = seg_probs(seg, img, device, SCALES, FLIP, seg.mult)
+        mask = (torch.log(p.clamp(min=1e-6)) + bt).argmax(0).byte().cpu().numpy()
+        Image.fromarray(mask, mode="L").save(os.path.join(output_dir, "seg_masks", stem + ".png"))
+        out = quantize(to_u8(_restore_fit(rest, img, device, _cond(rest, stem))), QUANT_STEP)
+        Image.fromarray(out).save(os.path.join(output_dir, "restored", stem + ".png"))

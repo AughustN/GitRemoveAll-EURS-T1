@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
-weights/.downloaded_by_repro_check
+# weights are downloaded from the link in weights/weights_link.yaml, never committed
+weights/*
+!weights/README.md
+!weights/weights_link.yaml

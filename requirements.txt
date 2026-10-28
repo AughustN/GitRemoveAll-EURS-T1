@@ -1,5 +1,2 @@
-# Extra pip packages beyond the organizers' base image, with pinned versions.
-# The base image already has: PyTorch 2.4.0 (CUDA 12.1), numpy, pillow, opencv-python-headless, timm, einops,
-# onnx, pyyaml, scipy, scikit-image. Leave this file empty (comments only) if you need nothing else.
-# Example:
-# kornia==0.7.3
+# DINOv3 backbone of the segmentation model (transformers 5.x needs PyTorch >= 2.6; 4.57.6 runs on the base image's 2.4.0)
+transformers==4.57.6
