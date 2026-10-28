@@ -1,2 +1,6 @@
-Put your checkpoint here (small models), or describe where to download it in `weights_link.yaml` (large ones).
-`run.py` receives this folder as `model_dir`.
+The weights are not committed. `weights_link.yaml` points to one public zip on Hugging Face
+(`eurs_t1_weights.zip`, 1.57 GB). Fetch and unpack it here with
+
+    python repro_check.py . --download-weights
+
+`run.py` gets this folder as `model_dir` and finds the files below it by name.
