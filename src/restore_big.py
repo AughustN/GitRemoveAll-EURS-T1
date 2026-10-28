@@ -1,26 +1,32 @@
-"""RestoreNet – nhánh restore lớn cho Track 1 (không giới hạn compute).
+"""RestoreNet: the large restoration network of Track 1 (unlimited compute).
 
-Ý tưởng ghép từ 3 bài (plan/05_RESTORE_PAPERS.md):
-- Trường affine màu theo vị trí như EURS-Lite (I = J·t + B(1 − t) ⇒ J là affine của I), nhưng dự đoán từ encoder
-  ConvNeXt có pretrain ImageNet thay vì MobileNetV2 0.6M train từ đầu → tổng quát tốt hơn trên scene mới.
-- DarkIR (CVPR 2025): sửa sáng ở độ phân giải thấp + loss phụ trên output H/8 (L_lol); decoder full-res dùng
-  depthwise dilated 1/4/9 + gating (Di-SpAM / GatedFFN) để giữ độ nét (sharpness, SSIM) thay cho unsharp mask.
-- HVI-CIDNet (CVPR 2025): tách màu / cường độ → loss cosine màu tách riêng khỏi L1 (đã có trong restore_loss).
+It combines ideas from three lines of work:
+- A spatially varying colour-affine field as in EURS-Lite (I = J·t + B(1 − t) => J is an affine transform of I), but
+  predicted by an ImageNet-pretrained ConvNeXt encoder instead of a 0.6M MobileNetV2 trained from scratch, which
+  generalises better to unseen scenes.
+- DarkIR (CVPR 2025): correct the brightness at low resolution, with an auxiliary loss on the H/8 output; the
+  full-resolution decoder uses depthwise convs with dilation 1/4/9 + gating (Di-SpAM / GatedFFN) to keep sharpness
+  and SSIM, instead of an unsharp mask.
+- HVI-CIDNet (CVPR 2025): separate colour and intensity, here as a colour cosine loss next to L1 (in the training loss).
 
-forward(x) trả (restored (B,3,H,W) [0,1], aux (B,3,H/8,W/8)) – cùng giao diện (r, _) với EURS-Lite nên
-train_common.restore_full dùng chung được. H, W phải chia hết cho 32 (restore_full tự pad).
+forward(x) returns (restored (B,3,H,W) in [0,1], aux (B,3,H/8,W/8)), the same (r, _) interface as EURS-Lite.
+H and W must be multiples of 32 (restore_full pads).
 
-Điều kiện hoá theo loại nước (cond, ý tưởng Osmosis ECCV 2024 + InstructIR ECCV 2024):
-- vector điều kiện c = [xác suất 10 type, level/100] (COND_DIM = 11) → FiLM trên feature FPN và full-res + bù vào
-  tham số affine; mọi lớp FiLM khởi tạo 0 → lúc đầu y hệt bản không điều kiện (nạp checkpoint cũ với strict=False).
-- cond="est"   : head trên feature H/32 tự ước lượng type (10 lớp) + level (hồi quy) từ ảnh → không cần metadata.
-- cond="oracle": c lấy từ type/level thật (tên file) → mức trần để so với "est".
-- cond="none"  : như cũ.
+Conditioning on the water type (cond; ideas from Osmosis, ECCV 2024, and InstructIR, ECCV 2024):
+- condition vector c = [probabilities of the 10 types, level/100] (COND_DIM = 11) -> FiLM on the FPN and
+  full-resolution features + an offset on the affine parameters; every FiLM layer starts at zero, so the model
+  starts exactly as the unconditioned one (older checkpoints load with strict=False).
+- cond="est"   : a head on the H/32 features estimates the type (10 classes) + level (regression) from the image,
+                 so no metadata is needed; the submitted model uses this mode and, in run.py, receives the true
+                 type and level from the file name when they are there.
+- cond="oracle": c always comes from the true type/level (file name).
+- cond="none"  : no conditioning.
 
-Khuếch đại input (amp=True, ý tưởng Learning-to-See-in-the-Dark CVPR 2018 + DarkIR CVPR 2025): ảnh "blackout" chỉ còn
-1–7 mức xám (chênh 1/255) → sau chuẩn hoá ImageNet encoder gần như không thấy. Thêm bản kéo giãn theo từng ảnh, từng kênh
-xs = (x − min)/max(max − min, 1/255) làm 3 kênh phụ cho encoder (stem ConvNeXt 3 → 6 kênh) và cho stem full-res;
-trọng số kênh phụ khởi tạo 0 → lúc đầu y hệt bản không amp, pretrain giữ nguyên.
+Input amplification (amp=True; ideas from Learning-to-See-in-the-Dark, CVPR 2018, and DarkIR): "blackout" images
+have only 1–7 grey levels (steps of 1/255), which the encoder barely sees after ImageNet normalisation. A copy
+stretched per image and per channel, xs = (x − min)/max(max − min, 1/255), is added as 3 extra channels for the
+encoder (ConvNeXt stem 3 -> 6 channels) and for the full-resolution stem; the extra weights start at zero, so the
+model starts exactly as without amp and the pretrained weights are kept.
 """
 import torch
 import torch.nn as nn
@@ -33,20 +39,20 @@ COND_DIM = N_TYPES + 1
 
 
 def make_cond(wtype, level):
-    """type (1–10) + level (5–100) thật → vector điều kiện (B, 11): one-hot type, level/100."""
+    """True type (1–10) + level (5–100) -> condition vector (B, 11): one-hot type, level/100."""
     wtype, level = torch.as_tensor(wtype).long().view(-1), torch.as_tensor(level).float().view(-1)
     return torch.cat([F.one_hot((wtype - 1).clamp(0, N_TYPES - 1), N_TYPES).float(), (level / LEVEL_MAX)[:, None]], 1)
 
 
 def stretch(x):
-    """Kéo giãn từng ảnh, từng kênh về [0, 1]; ảnh hằng số → 0. Tính fp32."""
+    """Stretch each image and channel to [0, 1]; a constant image gives 0. Computed in fp32."""
     xf = x.float()
     lo, hi = xf.amin((2, 3), keepdim=True), xf.amax((2, 3), keepdim=True)
     return ((xf - lo) / (hi - lo).clamp(min=1 / 255)).to(x.dtype)
 
 
 def widen_conv(conv, extra):
-    """Conv2d cin → cin + extra; trọng số cũ giữ nguyên, kênh thêm = 0."""
+    """Conv2d cin -> cin + extra; the old weights are kept, the extra channels are 0."""
     new = nn.Conv2d(conv.in_channels + extra, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
                     conv.dilation, conv.groups, conv.bias is not None)
     with torch.no_grad():
@@ -65,7 +71,7 @@ def zero_linear(cin, cout):
 
 
 def film(x, prm):
-    """x (B,C,H,W), prm (B,2C) = [scale, shift] → x·(1 + scale) + shift."""
+    """x (B,C,H,W), prm (B,2C) = [scale, shift] -> x·(1 + scale) + shift."""
     s, b = prm.chunk(2, 1)
     return x * (1 + s[:, :, None, None]) + b[:, :, None, None]
 
@@ -90,8 +96,8 @@ class LayerNorm2d(nn.Module):
 
 
 class DiBlock(nn.Module):
-    """Block decoder kiểu DarkIR: Di-SpAM (DW 3×3 dilation 1/4/9 cộng lại → SimpleGate → channel attention)
-    + GatedFFN; cả hai nhánh residual có hệ số học được khởi tạo 0 (như NAFNet)."""
+    """DarkIR-style decoder block: Di-SpAM (sum of DW 3×3 with dilation 1/4/9 -> SimpleGate -> channel attention)
+    + GatedFFN; both residual branches have learnable scales initialised to 0 (as in NAFNet)."""
 
     def __init__(self, c, dil=(1, 4, 9), ffn=2):
         super().__init__()
@@ -115,24 +121,25 @@ class DiBlock(nn.Module):
 
 
 def apply_affine(p, x):
-    """p (B,12,H,W) = ma trận 3×3 (hàng) + bias 3; x (B,3,H,W)."""
+    """p (B,12,H,W) = 3×3 matrix (row-major) + 3 biases; x (B,3,H,W)."""
     r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
     return torch.cat([p[:, 3 * c:3 * c + 1] * r + p[:, 3 * c + 1:3 * c + 2] * g + p[:, 3 * c + 2:3 * c + 3] * b
                       for c in range(3)], 1) + p[:, 9:12]
 
 
 CI_EPS = 1e-3
-CI_DIM = 3 + 12  # đường cong cường độ (log gain, log gamma, offset) + affine 3×3 + bias trên chroma
+CI_DIM = 3 + 12  # intensity curve (log gain, log gamma, offset) + 3×3 affine + bias on chroma
 
 
 def apply_ci(q, x):
-    """Hiệu chỉnh tách màu / cường độ (ý tưởng HVI-CIDNet, CVPR 2025) chồng lên output affine x (B,3,H,W).
-    Y = max(R,G,B) (cường độ kiểu HSV/HVI), c = x / Y (chroma, kênh lớn nhất = 1).
-    Y' = exp(q0)·Y^exp(q1) + q2 : đường cong phi tuyến cho vùng tối (affine RGB không biểu diễn được gamma);
-    c' = (I + M)·c + d với M, d = q3..q14 : sửa ám màu tách khỏi độ sáng. Output = c'·Y'.
-    q (B,15,H,W) = 0 → output = x (đồng nhất). Tính fp32 (pow / chia ổn định dưới autocast)."""
+    """Separate colour / intensity correction (idea of HVI-CIDNet, CVPR 2025) on top of the affine output x (B,3,H,W).
+    Y = max(R,G,B) (HSV/HVI-style intensity), c = x / Y (chroma, largest channel = 1).
+    Y' = exp(q0)·Y^exp(q1) + q2 : non-linear curve for dark regions (an RGB affine cannot express a gamma);
+    c' = (I + M)·c + d with M, d = q3..q14 : colour cast corrected separately from brightness. Output = c'·Y'.
+    q (B,15,H,W) = 0 -> output = x (identity). Computed in fp32 (pow / division stay stable under autocast).
+    Not used in the submitted model (ci=False)."""
     dt, x, q = x.dtype, x.float(), q.float()
-    xp = x.clamp(min=0)  # affine có thể ra giá trị âm → c = x/Y nổ; phần âm đi thẳng qua (residual)
+    xp = x.clamp(min=0)  # the affine output can be negative, which would blow up c = x/Y; the negative part passes through (residual)
     Y = xp.amax(1, keepdim=True).clamp(min=CI_EPS)
     c = xp / Y
     Y2 = torch.exp(q[:, 0:1]) * Y.pow(torch.exp(q[:, 1:2])) + q[:, 2:3]
@@ -149,16 +156,16 @@ class RestoreNet(nn.Module):
         import timm
         self.enc = timm.create_model(backbone, features_only=True, pretrained=pretrained, out_indices=(0, 1, 2, 3))
         ch = self.enc.feature_info.channels()  # strides 4, 8, 16, 32
-        if self.amp:  # conv đầu tiên nhận RGB (stem ConvNeXt) → thêm 3 kênh xs
+        if self.amp:  # first conv that takes RGB (ConvNeXt stem) -> add the 3 xs channels
             name = next(n for n, m in self.enc.named_modules() if isinstance(m, nn.Conv2d) and m.in_channels == 3)
             parent, attr = self.enc.get_submodule(name.rpartition(".")[0]) if "." in name else self.enc, name.rpartition(".")[2]
             setattr(parent, attr, widen_conv(getattr(parent, attr), 3))
         self.register_buffer("mean", MEAN.clone(), persistent=False)
         self.register_buffer("std", STD.clone(), persistent=False)
-        # FPN top-down tới H/4
+        # top-down FPN down to H/4
         self.lat = nn.ModuleList([nn.Conv2d(c, d, 1) for c in ch])
         self.smooth = nn.ModuleList([conv_gn(d, d) for _ in ch[:3]])
-        # trường affine: local ở H/8 + global từ H/32, khởi tạo = biến đổi đồng nhất
+        # affine field: local at H/8 + global from H/32, initialised to the identity
         self.aff_local = nn.Sequential(conv_gn(d, 64), nn.Conv2d(64, 12, 1))
         self.aff_glob = nn.Sequential(nn.Linear(ch[3], 128), nn.GELU(), nn.Linear(128, 12))
         for m in (self.aff_local[-1], self.aff_glob[-1]):
@@ -166,7 +173,7 @@ class RestoreNet(nn.Module):
             nn.init.zeros_(m.bias)
         self.register_buffer("eye", torch.tensor([1., 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]).view(1, 12, 1, 1),
                              persistent=False)
-        # refine full-res: [I, affine(I), feature H/4 nội suy] → DiBlock × n → residual 3 kênh (zero-init)
+        # full-res refinement: [I, affine(I), upsampled H/4 features] -> DiBlock × n -> 3-channel residual (zero-init)
         self.f4 = nn.Conv2d(d, c_full, 1)
         self.stem = nn.Conv2d(6, c_full, 3, padding=1)
         if self.amp:
@@ -176,28 +183,28 @@ class RestoreNet(nn.Module):
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
         self.backbone_name = backbone
-        if self.ci:  # tham số tách màu / cường độ ở H/8 (local) + toàn cục H/32, zero-init → đồng nhất
+        if self.ci:  # colour / intensity parameters at H/8 (local) + global from H/32, zero-init -> identity
             self.ci_local = nn.Sequential(conv_gn(d, 64), nn.Conv2d(64, CI_DIM, 1))
             self.ci_glob = nn.Sequential(nn.Linear(ch[3], 128), nn.GELU(), nn.Linear(128, CI_DIM))
             for m in (self.ci_local[-1], self.ci_glob[-1]):
                 nn.init.zeros_(m.weight)
                 nn.init.zeros_(m.bias)
         if cond != "none":
-            if cond == "est":  # type logits (10) + level (sigmoid → [0,1]) từ feature toàn cục H/32
+            if cond == "est":  # type logits (10) + level (sigmoid -> [0,1]) from the global H/32 features
                 self.est = nn.Sequential(nn.Linear(ch[3], 256), nn.GELU(), nn.Linear(256, N_TYPES + 1))
-            self.film_p = zero_linear(COND_DIM, 2 * d)       # FiLM chung cho 3 tầng FPN
-            self.film_h = zero_linear(COND_DIM, 2 * c_full)  # FiLM cho feature full-res
-            self.cond_aff = zero_linear(COND_DIM, 12)        # bù tham số affine theo loại nước
+            self.film_p = zero_linear(COND_DIM, 2 * d)       # one FiLM shared by the 3 FPN levels
+            self.film_h = zero_linear(COND_DIM, 2 * c_full)  # FiLM for the full-res features
+            self.cond_aff = zero_linear(COND_DIM, 12)        # water-type offset on the affine parameters
             if self.ci:
-                self.cond_ci = zero_linear(COND_DIM, CI_DIM)  # đường cong cường độ / chroma theo loại nước
+                self.cond_ci = zero_linear(COND_DIM, CI_DIM)  # water-type offset on the intensity / chroma curve
 
     def estimate(self, f3):
-        """f3 (B,C,h,w) → (type_logits (B,10), level (B,) trong [0,1])."""
+        """f3 (B,C,h,w) -> (type_logits (B,10), level (B,) in [0,1])."""
         o = self.est(f3.mean((2, 3)))
         return o[:, :N_TYPES], torch.sigmoid(o[:, N_TYPES])
 
     def encode(self, x, xs=None):
-        """Feature encoder 4 tầng (strides 4–32); amp → ghép thêm bản kéo giãn xs."""
+        """Encoder features at 4 levels (strides 4–32); with amp the stretched copy xs is concatenated."""
         z = (x - self.mean) / self.std
         if self.amp:
             z = torch.cat([z, ((stretch(x) if xs is None else xs) - self.mean) / self.std], 1)
@@ -207,9 +214,10 @@ class RestoreNet(nn.Module):
         return self.enc.parameters()
 
     def forward(self, x, heads=None, cond=None, return_est=False, mix=None):
-        """cond (B,11) (make_cond) ghi đè vector điều kiện – bắt buộc khi self.cond == 'oracle'; với 'est' truyền
-        cond = điều kiện thật để đo mức trần trên cùng model. return_est → thêm (type_logits, level) vào output.
-        mix = (cond_thật (B,11), w (B,1)) – chỉ 'est' khi train: cond = w·thật + (1 − w)·ước lượng (teacher forcing)."""
+        """cond (B,11) (from make_cond) overrides the condition vector; required when self.cond == 'oracle'. With
+        'est', passing the true condition uses it instead of the estimate (this is what run.py does with the file name).
+        return_est -> also return (type_logits, level).
+        mix = (true cond (B,11), w (B,1)), 'est' training only: cond = w·true + (1 − w)·estimate (teacher forcing)."""
         H, W = x.shape[-2:]
         xs = stretch(x) if self.amp else None
         f = self.encode(x, xs)
@@ -221,7 +229,7 @@ class RestoreNet(nn.Module):
                 if mix is not None:
                     cond = mix[1] * mix[0] + (1 - mix[1]) * cond
         elif self.cond == "oracle" and cond is None:
-            raise ValueError("RestoreNet(cond='oracle') cần cond = make_cond(type, level)")
+            raise ValueError("RestoreNet(cond='oracle') needs cond = make_cond(type, level)")
         if self.cond != "none":
             cond = cond.to(x.dtype)
         p = [l(t) for l, t in zip(self.lat, f)]
@@ -234,9 +242,9 @@ class RestoreNet(nn.Module):
         prm = self.aff_local(p[1]) + self.aff_glob(f[3].mean((2, 3)))[:, :, None, None] + self.eye  # (B,12,H/8,W/8)
         if self.cond != "none":
             prm = prm + self.cond_aff(cond)[:, :, None, None]
-        self.last_prm = prm if self.training else None  # train_restore --field_w: giám sát trường affine trực tiếp
+        self.last_prm = prm if self.training else None  # used in training to supervise the affine field directly
         x8 = F.avg_pool2d(x, 8)
-        aux = apply_affine(prm, x8)                     # output sửa màu ở H/8 (loss phụ kiểu DarkIR)
+        aux = apply_affine(prm, x8)                     # colour-corrected output at H/8 (DarkIR-style auxiliary loss)
         color = apply_affine(up(prm, (H, W)), x)
         if self.ci:
             q = self.ci_local(p[1]) + self.ci_glob(f[3].mean((2, 3)))[:, :, None, None]  # (B,15,H/8,W/8)
@@ -254,28 +262,30 @@ class RestoreNet(nn.Module):
 
 @torch.no_grad()
 def oracle_field(x, y, k=32, lam=1e-6, clip=30.0):
-    """Trường affine 'đáp án' (tham số fit bằng GT): affine 3×3 + bias bình phương tối thiểu trong từng ô k×k của cặp
-    (x suy giảm, y GT), xếp theo layout của apply_affine, nội suy bilinear về lưới H/8 của RestoreNet.
-    ceiling_probe.py (12/10): affine theo ô 32 px đạt 33.3 dB trên val trong khi model chỉ 27.4 ≈ affine toàn ảnh (27.6)
-    → model không học được phần thay đổi theo vị trí; giám sát thẳng θ cho tín hiệu dày hơn loss trên ảnh.
-    x, y (B,3,H,W), H, W chia hết cho k và 8 → (B,12,H/8,W/8), tính fp32."""
+    """Target affine field fitted to the GT: least-squares 3×3 affine + bias in each k×k cell of the pair
+    (x degraded, y GT), in the layout of apply_affine, bilinearly resized to the H/8 grid of RestoreNet.
+    A per-cell fit with 32 px cells reached 33.3 dB on our validation scenes while the model was at 27.4 dB, close to a
+    single whole-image affine (27.6 dB): the model was not learning the spatial part, and supervising θ directly
+    gives a denser signal than an image loss. Training only.
+    x, y (B,3,H,W), H and W multiples of k and 8 -> (B,12,H/8,W/8), computed in fp32."""
     x, y = x.float(), y.float()
     B, _, H, W = x.shape
     ux = F.unfold(x, k, stride=k).view(B, 3, k * k, -1).permute(0, 3, 2, 1)   # (B,L,N,3)
     uy = F.unfold(y, k, stride=k).view(B, 3, k * k, -1).permute(0, 3, 2, 1)
     X = torch.cat([ux, torch.ones_like(ux[..., :1])], -1)                     # (B,L,N,4)
-    # ridge kéo về biến đổi đồng nhất (không về 0): 3 kênh màu tương quan mạnh → bình phương tối thiểu suy biến,
-    # kéo về 0 làm θ lệch xa đồng nhất; kéo về I thì x = y cho đúng θ = I và ô phẳng / tối giữ gần I
+    # ridge towards the identity (not towards 0): the 3 colour channels are strongly correlated, so plain least squares
+    # is ill-conditioned and a pull towards 0 moves θ far from the identity; towards I, x = y gives exactly θ = I and
+    # flat or dark cells stay close to I
     I = lam * k * k * torch.eye(4, device=x.device)
     M0 = torch.eye(4, 3, device=x.device)
     M = torch.linalg.solve(X.transpose(-1, -2) @ X + I, X.transpose(-1, -2) @ uy + I @ M0)  # (B,L,4,3): M[i, c]
-    p = torch.cat([M[..., :3, c] for c in range(3)] + [M[..., 3, :]], -1)     # (B,L,12) = layout apply_affine
+    p = torch.cat([M[..., :3, c] for c in range(3)] + [M[..., 3, :]], -1)     # (B,L,12) = apply_affine layout
     p = p.clamp(-clip, clip).permute(0, 2, 1).reshape(B, 12, H // k, W // k)
     return F.interpolate(p, size=(H // 8, W // 8), mode="bilinear", align_corners=False)
 
 
 def build_restore(ck, device="cpu"):
-    """Dựng model restore từ checkpoint (ck['arch'] = 'lite' | 'big'); trả model eval trên device."""
+    """Build the restoration model from a checkpoint (ck['arch'] = 'lite' | 'big'); returns it in eval mode on device."""
     arch = ck.get("arch", "lite")
     if arch == "big":
         net = RestoreNet(pretrained=False, **ck.get("arch_args", {}))
@@ -292,13 +302,13 @@ if __name__ == "__main__":
     for mode in ("none", "est", "oracle"):
         for ci in (False, True):
             torch.manual_seed(0)
-            m = RestoreNet(pretrained=False, cond=mode, ci=ci, amp=ci)  # amp thử chung với ci cho gọn
+            m = RestoreNet(pretrained=False, cond=mode, ci=ci, amp=ci)  # amp is tested together with ci to keep it short
             n = sum(p.numel() for p in m.parameters())
             r, a, e = m(x, cond=c if mode == "oracle" else None, return_est=True)
             print(mode, "ci+amp" if ci else "      ", f"params {n / 1e6:.3f}M", tuple(r.shape), tuple(a.shape),
                   None if e is None else tuple(e[0].shape), f"|out-x| {float((r - x).abs().mean()):.6f}")
     q = torch.zeros(2, CI_DIM, 4, 5)
-    print("apply_ci(0) = đồng nhất:", float((apply_ci(q, x[..., :4, :5]) - x[..., :4, :5]).abs().max()))
+    print("apply_ci(0) = identity:", float((apply_ci(q, x[..., :4, :5]) - x[..., :4, :5]).abs().max()))
     torch.manual_seed(0)
     m0 = RestoreNet(pretrained=False, cond="est")
     m1 = RestoreNet(pretrained=False, cond="est", amp=True)
@@ -306,10 +316,10 @@ if __name__ == "__main__":
     for k, v in m0.state_dict().items():
         sd[k] = v if sd[k].shape == v.shape else torch.cat([v, torch.zeros_like(sd[k][:, v.shape[1]:])], 1)
     m1.load_state_dict(sd)
-    for net in (m0, m1):  # đổi head để output khác x → kiểm tra amp với kênh phụ = 0 ra y hệt bản thường
+    for net in (m0, m1):  # change a head so the output differs from x -> check that amp with zero extra channels equals the plain model
         net.eval()
     with torch.no_grad():
         nn.init.normal_(m0.aff_glob[-1].weight, std=0.01); m1.aff_glob[-1].weight.copy_(m0.aff_glob[-1].weight)
-        print("amp (kênh phụ = 0) = bản thường:", float((m0(x)[0] - m1(x)[0]).abs().max()))
-    print("stretch ảnh hằng số:", float(stretch(torch.zeros(1, 3, 8, 8)).abs().max()),
-          "| ảnh 0/1 mức:", stretch(torch.tensor([0., 1 / 255]).view(1, 1, 1, 2).repeat(1, 3, 1, 1))[0, 0].tolist())
+        print("amp (extra channels = 0) = plain model:", float((m0(x)[0] - m1(x)[0]).abs().max()))
+    print("stretch of a constant image:", float(stretch(torch.zeros(1, 3, 8, 8)).abs().max()),
+          "| image with levels 0/1:", stretch(torch.tensor([0., 1 / 255]).view(1, 1, 1, 2).repeat(1, 3, 1, 1))[0, 0].tolist())
